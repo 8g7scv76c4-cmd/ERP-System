@@ -9,7 +9,7 @@ eine Zeile pro Hauptgruppe/Gruppe, in die man den Verschnitt einträgt.
 Optional kann in der Spalte "Stichwort" ein Text stehen; die Regel gilt dann
 nur für Artikel, deren RWDM-Nr., Beschreibung oder Katalogpfad ihn enthält
 (z. B. Gruppe "Blum Legrabox" + Stichwort "Zargen"). Regeln mit Stichwort
-haben Vorrang vor Regeln ohne.
+haben Vorrang vor Regeln ohne; passen mehrere, gewinnt die obere.
 
 Länge, Breite und Dicke (in mm) werden aus der Beschreibung gelesen
 ("Länge 1200mm", "NL=450", "30x3mm", "... 2500mm"). Kleinteile wie Topfbänder,
@@ -160,8 +160,9 @@ def lese_regeln(pfad):
     if fehlend:
         raise SystemExit(f"In {pfad} fehlen die Spalten: {', '.join(sorted(fehlend))}")
     regeln = regeln[regeln["Verschnitt"].str.strip() != ""]
-    # Regeln mit Stichwort zuerst, damit sie Vorrang haben
-    return regeln.sort_values("Stichwort", key=lambda s: s == "")
+    # Regeln mit Stichwort zuerst, damit sie Vorrang haben; sonst gilt die
+    # Reihenfolge in der Tabelle (erste passende Regel gewinnt)
+    return regeln.sort_values("Stichwort", key=lambda s: s == "", kind="stable")
 
 
 def verschnitt_fuer(artikel, regeln):
