@@ -1,0 +1,5 @@
+# Firmendaten nie ins Repository
+*.csv
+*.xlsx
+*.xls
+*.docx
