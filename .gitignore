@@ -3,3 +3,4 @@
 *.xlsx
 *.xls
 *.docx
+__pycache__/
