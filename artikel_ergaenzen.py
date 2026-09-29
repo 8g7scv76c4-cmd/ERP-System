@@ -11,6 +11,11 @@ nur für Artikel, deren RWDM-Nr., Beschreibung oder Katalogpfad ihn enthält
 (z. B. Gruppe "Blum Legrabox" + Stichwort "Zargen"). Regeln mit Stichwort
 haben Vorrang vor Regeln ohne.
 
+Länge, Breite und Dicke (in mm) werden aus der Beschreibung gelesen
+("Länge 1200mm", "NL=450", "30x3mm", "... 2500mm"). Kleinteile wie Topfbänder,
+Schlösser und Schrauben (siehe OHNE_MASSE) bleiben leer. Jeder Fund steht mit
+Fundstelle in "Masse_Kontrolle.xlsx" zum Nachprüfen.
+
 Die Ausgabe-CSV hat dasselbe Format wie die Eingabe (Semikolon, Windows-1252,
 CRLF), damit OrgaCalc sie wie gewohnt einlesen kann. Alle Werte bleiben Text,
 Bestellnummern werden also nicht verändert.
@@ -18,6 +23,7 @@ Bestellnummern werden also nicht verändert.
 
 import argparse
 import csv
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -25,6 +31,97 @@ import pandas as pd
 ENCODING = "cp1252"
 NEUE_SPALTEN = ["Länge", "Breite", "Dicke", "Verschnitt"]
 REGEL_SPALTEN = ["Hauptgruppe Name", "Gruppe Name", "Stichwort", "Verschnitt"]
+
+# Kleinteile, bei denen OrgaCalc keine Masse braucht (Topfbänder, Schlösser, Schrauben ...)
+OHNE_MASSE = {
+    "Moebelband", "Tuerband", "Tuerbeschlag", "Moebelschliessung", "Verbindungen",
+    "M-Schrauben", "Montage-Schrauben", "Puffer", "Magnet", "Winkelverbinder",
+    "Verstaerkungswinkel", "Ausrichtbeschlag", "Rollen", "Moebeloeffnung", "Antrieb",
+    "Klappe", "Armaturen", "Becken",
+}
+# Profile/Rohre: "AxB" ist der Querschnitt, die Länge kommt aus dem Projekt
+QUERSCHNITT_GRUPPEN = {"MetallProfil", "AluProfil", "Schlitzrohr T30", "Schlitzrohr T35", "Schlitzrohr T50"}
+
+ZAHL = r"(\d+(?:[.,]\d+)?)"
+EINHEIT = r"\s*(mm|cm|m)\b"
+RE_LAENGE = re.compile(
+    r"(?:\b(?:Lagerlänge|Länge|NL|L)\s*[:=]?\s*)" + ZAHL + r"(?:" + EINHEIT + r")?(?![\d-])",
+    re.IGNORECASE,
+)
+RE_BREITE = re.compile(r"\b(?:B|Breite)\s*[:=]?\s*" + ZAHL + EINHEIT + r"|" + ZAHL + EINHEIT + r"\s*Breit",
+                       re.IGNORECASE)
+RE_DICKE = re.compile(r"\b(?:Dicke|Stärke)\s*[:=]?\s*" + ZAHL + EINHEIT + r"|" + ZAHL + EINHEIT + r"\s*Dick",
+                      re.IGNORECASE)
+RE_QUER = re.compile(r"(?<![M\d.,])" + ZAHL + r"\s*(?:mm)?\s*x\s*" + ZAHL + r"(?:\s*x\s*" + ZAHL + r")?" + EINHEIT, re.IGNORECASE)
+# Zahl mit Einheit ohne Kennwort davor, z. B. "Griffleiste ... silber 2500mm"
+RE_NACKT = re.compile(r"(?<![\d.,x/-])" + ZAHL + EINHEIT + r"(?![\w-])", re.IGNORECASE)
+# Kennwörter, deren Zahl kein Artikelmass ist (Dornmass, Lochabstand, Korpusbreite ...)
+KEIN_MASS = re.compile(
+    r"^(?:DM|Dis|N|Stulp|Eckstulp|LA|Lochabstand|KB|Korpusbreite|Plattendicke|Materialstärke|Lochteil|"
+    r"Ausladung|für|Ø|ø|D|H|Höhe|Profilhöhe|Tief|Türdicke|Türendicke|Lagerlänge|Länge|NL|L|B|Breite|"
+    r"Dicke|Stärke|Türstärke|Se|WS|T|M\d*|[\d.,]*x)[:=]?$",
+    re.IGNORECASE,
+)
+
+
+def _mm(zahl, einheit):
+    wert = float(zahl.replace(",", "."))
+    wert *= {"m": 1000, "cm": 10}.get((einheit or "mm").lower(), 1)
+    return f"{wert:g}"
+
+
+def masse_aus_beschreibung(text, hauptgruppe="", gruppe=""):
+    """Liest Länge, Breite und Dicke (in mm) aus der Beschreibung.
+
+    Gibt (länge, breite, dicke, fundstelle) zurück; nicht gefundene Werte sind "".
+    """
+    if hauptgruppe in OHNE_MASSE:
+        return "", "", "", ""
+    laenge = breite = dicke = ""
+    funde = []
+
+    for m in RE_LAENGE.finditer(text):
+        # ohne Einheit nur ab 3 Stellen ("NL450", "L0300"), sonst z. B. Grösse "L7"
+        if m.group(2) or len(m.group(1)) >= 3:
+            laenge = _mm(m.group(1), m.group(2))
+            funde.append(m.group(0).strip())
+            break
+    if m := RE_BREITE.search(text):
+        breite = _mm(m.group(1) or m.group(3), m.group(2) or m.group(4))
+        funde.append(m.group(0).strip())
+    if m := RE_DICKE.search(text):
+        dicke = _mm(m.group(1) or m.group(3), m.group(2) or m.group(4))
+        funde.append(m.group(0).strip())
+
+    rest = text
+    if m := RE_QUER.search(text):
+        rest = text[: m.start()] + " " + text[m.end():]
+        a, b, c, einheit = m.group(1), m.group(2), m.group(3), m.group(4)
+        werte = [_mm(w, einheit) for w in (a, b, c) if w]
+        if gruppe in QUERSCHNITT_GRUPPEN or hauptgruppe in QUERSCHNITT_GRUPPEN:
+            # Querschnitt: Breite x Höhe (x Wandstärke) -> Breite, Dicke
+            breite, dicke = breite or werte[0], dicke or werte[1]
+        elif len(werte) == 3:
+            laenge, breite, dicke = laenge or werte[0], breite or werte[1], dicke or werte[2]
+        elif float(werte[1]) <= 20:
+            breite, dicke = breite or werte[0], dicke or werte[1]
+        else:
+            breite, laenge = breite or werte[0], laenge or werte[1]
+        funde.append(m.group(0).strip())
+
+    if not laenge:
+        # letzte "nackte" Zahl mit Einheit, z. B. Profillänge am Textende
+        for m in reversed(list(RE_NACKT.finditer(rest))):
+            davor = rest[: m.start()].split()
+            wort = davor[-1].rstrip(",") if davor else ""
+            wert = _mm(m.group(1), m.group(2))
+            # kleine Zahlen sind meist Stärken/Durchmesser, keine Länge
+            if not KEIN_MASS.match(wort) and float(wert) >= 50:
+                laenge = wert
+                funde.append(m.group(0).strip())
+                break
+
+    return laenge, breite, dicke, " | ".join(funde)
 
 
 def lese_artikel(pfad):
@@ -93,6 +190,29 @@ def main():
     for spalte in NEUE_SPALTEN:
         if spalte not in df.columns:
             df[spalte] = ""
+
+    masse = df.apply(
+        lambda r: masse_aus_beschreibung(r["Beschreibung"], r["Hauptgruppe Name"], r["Gruppe Name"]),
+        axis=1, result_type="expand",
+    )
+    masse.columns = ["Länge", "Breite", "Dicke", "Fundstelle"]
+    for spalte in ("Länge", "Breite", "Dicke"):
+        leer = df[spalte] == ""
+        df.loc[leer, spalte] = masse.loc[leer, spalte]
+    gefunden = masse["Fundstelle"] != ""
+    kontrolle = pd.concat(
+        [df.loc[gefunden, ["Id", "RWDM-Nr.", "Hauptgruppe Name", "Gruppe Name", "Beschreibung"]],
+         masse.loc[gefunden]], axis=1,
+    )
+    kontrolle_pfad = args.csv.with_name("Masse_Kontrolle.xlsx")
+    with pd.ExcelWriter(kontrolle_pfad) as writer:
+        kontrolle.to_excel(writer, sheet_name="Masse", index=False)
+        ws = writer.book["Masse"]
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        for spalte, breite in zip("ABCDEFGHI", (7, 30, 18, 24, 80, 9, 9, 9, 40)):
+            ws.column_dimensions[spalte].width = breite
+    print(f"Masse gefunden bei {gefunden.sum()} Artikeln, Kontrollliste: {kontrolle_pfad}")
 
     if args.regeln:
         regeln = lese_regeln(args.regeln)
